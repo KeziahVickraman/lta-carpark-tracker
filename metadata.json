@@ -1,0 +1,6 @@
+{
+  "name": "SG Carpark Watch",
+  "description": "Real-time Singapore carpark lot availability tracker covering HDB, LTA, URA, and shopping malls with live occupancy, parking rates, and EV chargers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

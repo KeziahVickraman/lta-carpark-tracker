@@ -1,7 +1,7 @@
 import { CarparkItem, DataGovSgResponse } from '../types/carpark';
 import { INITIAL_CARPARKS } from '../data/mockCarparks';
 
-export type DataSourceMode = 'simulated' | 'datagov' | 'custom';
+export type DataSourceMode = 'simulated' | 'datagov' | 'lta' | 'custom';
 
 export interface ApiConfig {
   sourceMode: DataSourceMode;
@@ -21,7 +21,7 @@ export const getDefaultApiConfig = (): ApiConfig => {
   }
   return {
     sourceMode: 'simulated',
-    customEndpointUrl: 'http://localhost:4000/api/carparks',
+    customEndpointUrl: '/api/carparkavailability',
     autoRefreshIntervalSec: 45
   };
 };
@@ -60,9 +60,92 @@ export async function fetchCarparkData(config: ApiConfig): Promise<{
   source: string;
   timestamp: string;
   latencyMs: number;
+  notice?: string;
 }> {
   const start = performance.now();
 
+  // 1. LTA DataMall Serverless API (/api/carparkavailability)
+  if (config.sourceMode === 'lta') {
+    try {
+      const response = await fetch('/api/carparkavailability?all=true');
+      const json = await response.json();
+      const end = performance.now();
+
+      if (!response.ok || !json.success) {
+        return {
+          data: getSimulatedFluctuatedData(),
+          source: 'LTA DataMall Gateway (Key Pending)',
+          timestamp: new Date().toLocaleTimeString('en-SG', { hour12: false }),
+          latencyMs: Math.round(end - start),
+          notice: json.error || 'LTA AccountKey not yet configured in environment.'
+        };
+      }
+
+      // Merge LTA records into carpark dataset
+      const records = json.data as Array<{
+        CarParkID: string;
+        Area: string;
+        Development: string;
+        AvailableLots: number;
+        LotType: string;
+        Agency: string;
+      }>;
+
+      const ltaMap = new Map<string, number>();
+      if (Array.isArray(records)) {
+        for (const item of records) {
+          const key = (item.Development || '').toLowerCase().trim();
+          ltaMap.set(key, item.AvailableLots);
+          ltaMap.set(item.CarParkID, item.AvailableLots);
+        }
+      }
+
+      const merged = INITIAL_CARPARKS.map(cp => {
+        const devKey = cp.name.toLowerCase();
+        let avail: number | undefined;
+
+        for (const [key, val] of ltaMap.entries()) {
+          if (devKey.includes(key) || key.includes(devKey.slice(0, 10))) {
+            avail = val;
+            break;
+          }
+        }
+
+        if (avail !== undefined && avail >= 0) {
+          return {
+            ...cp,
+            lots: {
+              ...cp.lots,
+              car: {
+                total: Math.max(cp.lots.car.total, avail),
+                available: avail
+              }
+            },
+            updated_at: json.timestamp || new Date().toISOString()
+          };
+        }
+        return cp;
+      });
+
+      return {
+        data: merged,
+        source: `LTA DataMall v2 Live (${records.length} lots)`,
+        timestamp: new Date().toLocaleTimeString('en-SG', { hour12: false }),
+        latencyMs: Math.round(end - start)
+      };
+    } catch (err: any) {
+      const end = performance.now();
+      return {
+        data: getSimulatedFluctuatedData(),
+        source: 'LTA DataMall (Offline fallback)',
+        timestamp: new Date().toLocaleTimeString('en-SG', { hour12: false }),
+        latencyMs: Math.round(end - start),
+        notice: err.message
+      };
+    }
+  }
+
+  // 2. Custom backend endpoint
   if (config.sourceMode === 'custom' && config.customEndpointUrl) {
     try {
       const response = await fetch(config.customEndpointUrl, {
@@ -91,9 +174,9 @@ export async function fetchCarparkData(config: ApiConfig): Promise<{
     }
   }
 
+  // 3. Official Data.gov.sg Direct API
   if (config.sourceMode === 'datagov') {
     try {
-      // Official Data.gov.sg Real-Time Carpark Availability Endpoint
       const response = await fetch('https://api.data.gov.sg/v1/transport/carpark-availability');
       if (!response.ok) {
         throw new Error(`Data.gov.sg error ${response.status}`);
@@ -101,7 +184,6 @@ export async function fetchCarparkData(config: ApiConfig): Promise<{
       const json: DataGovSgResponse = await response.json();
       const end = performance.now();
 
-      // Merge real Data.gov.sg lots into our known carparks
       const itemsMap = new Map<string, { carAvail: number; carTotal: number; time: string }>();
       if (json.items?.[0]?.carpark_data) {
         for (const cp of json.items[0].carpark_data) {
@@ -153,7 +235,7 @@ export async function fetchCarparkData(config: ApiConfig): Promise<{
   }
 
   // Default: Simulated real-world fluctuations
-  await new Promise(r => setTimeout(r, 120)); // realistic micro-tick
+  await new Promise(r => setTimeout(r, 120));
   const end = performance.now();
   return {
     data: getSimulatedFluctuatedData(),
@@ -167,11 +249,9 @@ let simulatedCache = [...INITIAL_CARPARKS];
 
 export function getSimulatedFluctuatedData(): CarparkItem[] {
   simulatedCache = simulatedCache.map(cp => {
-    // fluctuate available lots by -3 to +3 randomly, bounded by [0, total]
     const delta = Math.floor(Math.random() * 7) - 3;
     const newCarAvail = Math.max(0, Math.min(cp.lots.car.total, cp.lots.car.available + delta));
 
-    // Also slight deck fluctuation
     const newDecks = cp.decks.map(d => {
       const deckDelta = Math.floor(Math.random() * 3) - 1;
       return {
